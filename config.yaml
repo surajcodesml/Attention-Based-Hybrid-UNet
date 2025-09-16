@@ -35,68 +35,69 @@ augmentation:
       probability: 0.5
     vertical_flip:
       enabled: true
-      probability: 0.3
+      probability: 0.5
     rotation:
       enabled: true
-      probability: 0.4
-      limit: 15  # degrees
+      probability: 0.5
+      limit: 25  # degrees
     
   # Photometric transformations (applied only to images)
   photometric:
     invert_image:
       enabled: true
-      probability: 0.2
+      probability: 0.5
     random_snow:
       enabled: true
-      probability: 0.1
+      probability: 0.5
       snow_point_lower: 0.1
       snow_point_upper: 0.3
       brightness_coeff: 2.5
     clahe:
       enabled: true
-      probability: 0.3
+      probability: 0.5
       clip_limit: 4.0
       tile_grid_size: [8, 8]
     blur:
       enabled: true
-      probability: 0.3
+      probability: 0.5
       blur_limit: 7
     coarse_dropout:
       enabled: true
-      probability: 0.2
+      probability: 0.5
       num_holes_range: [1, 8]
       hole_height_range: [8, 32]
       hole_width_range: [8, 32]
       fill: 0
     downscale:
       enabled: true
-      probability: 0.2
+      probability: 0.5
       scale_range: [0.5, 0.9]
       interpolation_upscale: 0  # cv2.INTER_NEAREST
       interpolation_downscale: 0  # cv2.INTER_NEAREST
     equalize:
       enabled: true
-      probability: 0.3
+      probability: 0.5
       mode: "cv"
       by_channels: false
 
 # Training configuration
 training:
-  batch_size: 8
-  num_workers: 4
+  batch_size: 1  # Reduced for 4GB GPU memory
+  gradient_accumulation_steps: 4  # Simulate batch_size of 4
+  num_workers: 1  # Reduced to save memory
   shuffle: true
-  pin_memory: true
+  pin_memory: true  # Enable for GPU training
   drop_last: false
   learning_rate: 0.001
-  patience: 10
-  num_epochs: 100
+  patience: 15  # Increased patience for better convergence
+  num_epochs: 50
 
 # Model configuration
 model:
   input_channels: 1
   output_channels: 3
-  base_channels: 64
-  depth: 5
+  base_channels: 32  # Reduced from 64 to fit 4GB GPU
+  depth: 4           # Reduced from 5 to fit 4GB GPU
 
 # Paths
 paths:

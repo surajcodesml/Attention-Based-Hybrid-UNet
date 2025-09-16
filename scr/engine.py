@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import cv2
+from scipy.stats import pearsonr
 
 from .model import HybridAttentionUNet
 
@@ -198,6 +200,198 @@ class SegmentationMetrics:
         }
 
 
+def mask_to_coordinates(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert segmentation mask back to ILM and BM coordinates.
+    
+    Args:
+        mask: Segmentation mask of shape (H, W) with values {0, 1, 2}
+              0: above ILM, 1: ILM to BM, 2: below BM
+    
+    Returns:
+        Tuple of (ilm_coords, bm_coords) each of shape (W,)
+    """
+    height, width = mask.shape
+    ilm_coords = np.full(width, np.nan)
+    bm_coords = np.full(width, np.nan)
+    
+    for x in range(width):
+        column = mask[:, x]
+        
+        # Find ILM boundary (transition from 0 to 1)
+        ilm_indices = np.where((column[:-1] == 0) & (column[1:] == 1))[0]
+        if len(ilm_indices) > 0:
+            # Take the first transition point
+            ilm_coords[x] = ilm_indices[0] + 1
+        
+        # Find BM boundary (transition from 1 to 2)
+        bm_indices = np.where((column[:-1] == 1) & (column[1:] == 2))[0]
+        if len(bm_indices) > 0:
+            # Take the first transition point
+            bm_coords[x] = bm_indices[0] + 1
+    
+    return ilm_coords, bm_coords
+
+
+def concordance_correlation_coefficient(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Calculate Concordance Correlation Coefficient (CCC).
+    
+    Args:
+        y_true: Ground truth values
+        y_pred: Predicted values
+    
+    Returns:
+        CCC value
+    """
+    # Remove NaN values
+    valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+    if np.sum(valid_mask) == 0:
+        return 0.0
+    
+    y_true_valid = y_true[valid_mask]
+    y_pred_valid = y_pred[valid_mask]
+    
+    if len(y_true_valid) == 0:
+        return 0.0
+    
+    # Calculate means
+    mean_true = np.mean(y_true_valid)
+    mean_pred = np.mean(y_pred_valid)
+    
+    # Calculate variances
+    var_true = np.var(y_true_valid)
+    var_pred = np.var(y_pred_valid)
+    
+    # Calculate covariance
+    covariance = np.mean((y_true_valid - mean_true) * (y_pred_valid - mean_pred))
+    
+    # Calculate CCC
+    numerator = 2 * covariance
+    denominator = var_true + var_pred + (mean_true - mean_pred) ** 2
+    
+    if denominator == 0:
+        return 0.0
+    
+    ccc = numerator / denominator
+    return float(ccc)
+
+
+class RegressionMetrics:
+    """
+    Class to compute regression metrics for layer coordinate predictions.
+    Converts masks to coordinates and calculates MAE, RMSE, and CCC.
+    """
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """Reset all metrics."""
+        self.ilm_true_coords = []
+        self.ilm_pred_coords = []
+        self.bm_true_coords = []
+        self.bm_pred_coords = []
+    
+    def update(self, pred: torch.Tensor, target: torch.Tensor):
+        """
+        Update metrics with new batch.
+        
+        Args:
+            pred: Predicted logits of shape (B, C, H, W)
+            target: Ground truth labels of shape (B, H, W)
+        """
+        # Convert predictions to class indices
+        pred_classes = torch.argmax(pred, dim=1)
+        
+        # Convert to numpy
+        pred_masks = pred_classes.cpu().numpy()
+        target_masks = target.cpu().numpy()
+        
+        batch_size = pred_masks.shape[0]
+        
+        for i in range(batch_size):
+            # Convert masks to coordinates
+            ilm_true, bm_true = mask_to_coordinates(target_masks[i])
+            ilm_pred, bm_pred = mask_to_coordinates(pred_masks[i])
+            
+            self.ilm_true_coords.append(ilm_true)
+            self.ilm_pred_coords.append(ilm_pred)
+            self.bm_true_coords.append(bm_true)
+            self.bm_pred_coords.append(bm_pred)
+    
+    def compute(self) -> Dict[str, float]:
+        """
+        Compute final regression metrics.
+        
+        Returns:
+            Dictionary containing MAE, RMSE, and CCC for ILM and BM
+        """
+        if not self.ilm_true_coords:
+            return {
+                'ilm_mae': 0.0, 'ilm_rmse': 0.0, 'ilm_ccc': 0.0,
+                'bm_mae': 0.0, 'bm_rmse': 0.0, 'bm_ccc': 0.0,
+                'overall_mae': 0.0, 'overall_rmse': 0.0, 'overall_ccc': 0.0
+            }
+        
+        # Concatenate all coordinates
+        ilm_true_all = np.concatenate(self.ilm_true_coords)
+        ilm_pred_all = np.concatenate(self.ilm_pred_coords)
+        bm_true_all = np.concatenate(self.bm_true_coords)
+        bm_pred_all = np.concatenate(self.bm_pred_coords)
+        
+        # Calculate ILM metrics
+        ilm_mae = self._calculate_mae(ilm_true_all, ilm_pred_all)
+        ilm_rmse = self._calculate_rmse(ilm_true_all, ilm_pred_all)
+        ilm_ccc = concordance_correlation_coefficient(ilm_true_all, ilm_pred_all)
+        
+        # Calculate BM metrics
+        bm_mae = self._calculate_mae(bm_true_all, bm_pred_all)
+        bm_rmse = self._calculate_rmse(bm_true_all, bm_pred_all)
+        bm_ccc = concordance_correlation_coefficient(bm_true_all, bm_pred_all)
+        
+        # Calculate overall metrics (combining ILM and BM)
+        all_true = np.concatenate([ilm_true_all, bm_true_all])
+        all_pred = np.concatenate([ilm_pred_all, bm_pred_all])
+        overall_mae = self._calculate_mae(all_true, all_pred)
+        overall_rmse = self._calculate_rmse(all_true, all_pred)
+        overall_ccc = concordance_correlation_coefficient(all_true, all_pred)
+        
+        return {
+            'ilm_mae': ilm_mae,
+            'ilm_rmse': ilm_rmse,
+            'ilm_ccc': ilm_ccc,
+            'bm_mae': bm_mae,
+            'bm_rmse': bm_rmse,
+            'bm_ccc': bm_ccc,
+            'overall_mae': overall_mae,
+            'overall_rmse': overall_rmse,
+            'overall_ccc': overall_ccc
+        }
+    
+    def _calculate_mae(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Calculate Mean Absolute Error ignoring NaN values."""
+        valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        if np.sum(valid_mask) == 0:
+            return 0.0
+        
+        y_true_valid = y_true[valid_mask]
+        y_pred_valid = y_pred[valid_mask]
+        
+        return float(np.mean(np.abs(y_true_valid - y_pred_valid)))
+    
+    def _calculate_rmse(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Calculate Root Mean Square Error ignoring NaN values."""
+        valid_mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        if np.sum(valid_mask) == 0:
+            return 0.0
+        
+        y_true_valid = y_true[valid_mask]
+        y_pred_valid = y_pred[valid_mask]
+        
+        return float(np.sqrt(np.mean((y_true_valid - y_pred_valid) ** 2)))
+
+
 class TrainingEngine:
     """
     Training engine for Hybrid Attention U-Net.
@@ -258,13 +452,38 @@ class TrainingEngine:
             'val_iou': [],
             'train_f1': [],
             'val_f1': [],
+            'train_ilm_mae': [],
+            'val_ilm_mae': [],
+            'train_ilm_rmse': [],
+            'val_ilm_rmse': [],
+            'train_ilm_ccc': [],
+            'val_ilm_ccc': [],
+            'train_bm_mae': [],
+            'val_bm_mae': [],
+            'train_bm_rmse': [],
+            'val_bm_rmse': [],
+            'train_bm_ccc': [],
+            'val_bm_ccc': [],
+            'train_overall_mae': [],
+            'val_overall_mae': [],
+            'train_overall_rmse': [],
+            'val_overall_rmse': [],
+            'train_overall_ccc': [],
+            'val_overall_ccc': [],
             'learning_rate': []
         }
         
         # Best model tracking
         self.best_val_dice = 0.0
         self.best_model_path = None
+
+        ##################################
+        # Training parameters
+        training_config = config.get('training', {})
+        self.batch_size = training_config.get('batch_size', 1)
+        self.gradient_accumulation_steps = training_config.get('gradient_accumulation_steps', 1)
         
+        ################
         # Early stopping
         self.patience = config.get('patience', 10)
         self.early_stop_counter = 0
@@ -281,61 +500,78 @@ class TrainingEngine:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = f"runs/hybrid_unet_{timestamp}"
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Also ensure models directory exists
+        models_dir = "models"
+        os.makedirs(models_dir, exist_ok=True)
+        
         return output_dir
     
-    def train_epoch(self) -> Tuple[float, Dict[str, float]]:
+    def train_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
         Train for one epoch.
         
         Returns:
-            Tuple of (average_loss, metrics_dict)
+            Tuple of (average_loss, segmentation_metrics_dict, regression_metrics_dict)
         """
         self.model.train()
         total_loss = 0.0
-        metrics = SegmentationMetrics(num_classes=3, ignore_background=True)
+        seg_metrics = SegmentationMetrics(num_classes=3, ignore_background=True)
+        reg_metrics = RegressionMetrics()
         
         progress_bar = tqdm(self.train_loader, desc="Training")
+        
+        # Zero gradients at the start
+        self.optimizer.zero_grad()
         
         for batch_idx, (images, masks) in enumerate(progress_bar):
             images = images.to(self.device)
             masks = masks.to(self.device)
             
-            # Zero gradients
-            self.optimizer.zero_grad()
-            
             # Forward pass
             outputs = self.model(images)
             loss = self.criterion(outputs, masks)
             
+            # Scale loss by accumulation steps
+            loss = loss / self.gradient_accumulation_steps
+            
             # Backward pass
             loss.backward()
-            self.optimizer.step()
             
-            # Update metrics
-            total_loss += loss.item()
-            metrics.update(outputs.detach(), masks.detach())
+            # Update weights every gradient_accumulation_steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+            
+            # Track metrics (use unscaled loss for reporting)
+            batch_loss = loss.item() * self.gradient_accumulation_steps
+            total_loss += batch_loss
+            seg_metrics.update(outputs.detach(), masks.detach())
+            reg_metrics.update(outputs.detach(), masks.detach())
             
             # Update progress bar
             progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
+                'Loss': f'{batch_loss:.4f}',
                 'Avg Loss': f'{total_loss/(batch_idx+1):.4f}'
             })
         
         avg_loss = total_loss / len(self.train_loader)
-        metrics_dict = metrics.compute()
+        seg_metrics_dict = seg_metrics.compute()
+        reg_metrics_dict = reg_metrics.compute()
         
-        return avg_loss, metrics_dict
+        return avg_loss, seg_metrics_dict, reg_metrics_dict
     
-    def validate_epoch(self) -> Tuple[float, Dict[str, float]]:
+    def validate_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
         Validate for one epoch.
         
         Returns:
-            Tuple of (average_loss, metrics_dict)
+            Tuple of (average_loss, segmentation_metrics_dict, regression_metrics_dict)
         """
         self.model.eval()
         total_loss = 0.0
-        metrics = SegmentationMetrics(num_classes=3, ignore_background=True)
+        seg_metrics = SegmentationMetrics(num_classes=3, ignore_background=True)
+        reg_metrics = RegressionMetrics()
         
         with torch.no_grad():
             progress_bar = tqdm(self.val_loader, desc="Validation")
@@ -350,7 +586,8 @@ class TrainingEngine:
                 
                 # Update metrics
                 total_loss += loss.item()
-                metrics.update(outputs, masks)
+                seg_metrics.update(outputs, masks)
+                reg_metrics.update(outputs, masks)
                 
                 # Update progress bar
                 progress_bar.set_postfix({
@@ -359,9 +596,10 @@ class TrainingEngine:
                 })
         
         avg_loss = total_loss / len(self.val_loader)
-        metrics_dict = metrics.compute()
+        seg_metrics_dict = seg_metrics.compute()
+        reg_metrics_dict = reg_metrics.compute()
         
-        return avg_loss, metrics_dict
+        return avg_loss, seg_metrics_dict, reg_metrics_dict
     
     def save_model(self, epoch: int, metrics: Dict[str, float], is_best: bool = False):
         """Save model checkpoint."""
@@ -404,43 +642,88 @@ class TrainingEngine:
         
         epochs = range(1, len(self.history['train_loss']) + 1)
         
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        fig, axes = plt.subplots(3, 3, figsize=(20, 15))
         
         # Loss plot
-        ax1.plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-        ax1.plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-        ax1.set_title('Training and Validation Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+        axes[0, 0].plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=2)
+        axes[0, 0].plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=2)
+        axes[0, 0].set_title('Training and Validation Loss')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
         
         # Dice score plot
-        ax2.plot(epochs, self.history['train_dice'], 'b-', label='Train Dice', linewidth=2)
-        ax2.plot(epochs, self.history['val_dice'], 'r-', label='Val Dice', linewidth=2)
-        ax2.set_title('Dice Score')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Dice Score')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        axes[0, 1].plot(epochs, self.history['train_dice'], 'b-', label='Train Dice', linewidth=2)
+        axes[0, 1].plot(epochs, self.history['val_dice'], 'r-', label='Val Dice', linewidth=2)
+        axes[0, 1].set_title('Dice Score')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Dice Score')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
         
         # IoU plot
-        ax3.plot(epochs, self.history['train_iou'], 'b-', label='Train IoU', linewidth=2)
-        ax3.plot(epochs, self.history['val_iou'], 'r-', label='Val IoU', linewidth=2)
-        ax3.set_title('Intersection over Union (IoU)')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('IoU')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
+        axes[0, 2].plot(epochs, self.history['train_iou'], 'b-', label='Train IoU', linewidth=2)
+        axes[0, 2].plot(epochs, self.history['val_iou'], 'r-', label='Val IoU', linewidth=2)
+        axes[0, 2].set_title('Intersection over Union (IoU)')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('IoU')
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, alpha=0.3)
         
-        # F1 score plot
-        ax4.plot(epochs, self.history['train_f1'], 'b-', label='Train F1', linewidth=2)
-        ax4.plot(epochs, self.history['val_f1'], 'r-', label='Val F1', linewidth=2)
-        ax4.set_title('F1 Score')
-        ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('F1 Score')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
+        # ILM MAE plot
+        axes[1, 0].plot(epochs, self.history['train_ilm_mae'], 'b-', label='Train ILM MAE', linewidth=2)
+        axes[1, 0].plot(epochs, self.history['val_ilm_mae'], 'r-', label='Val ILM MAE', linewidth=2)
+        axes[1, 0].set_title('ILM Mean Absolute Error')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('MAE (pixels)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # BM MAE plot
+        axes[1, 1].plot(epochs, self.history['train_bm_mae'], 'b-', label='Train BM MAE', linewidth=2)
+        axes[1, 1].plot(epochs, self.history['val_bm_mae'], 'r-', label='Val BM MAE', linewidth=2)
+        axes[1, 1].set_title('BM Mean Absolute Error')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('MAE (pixels)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Overall MAE plot
+        axes[1, 2].plot(epochs, self.history['train_overall_mae'], 'b-', label='Train Overall MAE', linewidth=2)
+        axes[1, 2].plot(epochs, self.history['val_overall_mae'], 'r-', label='Val Overall MAE', linewidth=2)
+        axes[1, 2].set_title('Overall Mean Absolute Error')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('MAE (pixels)')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        # ILM CCC plot
+        axes[2, 0].plot(epochs, self.history['train_ilm_ccc'], 'b-', label='Train ILM CCC', linewidth=2)
+        axes[2, 0].plot(epochs, self.history['val_ilm_ccc'], 'r-', label='Val ILM CCC', linewidth=2)
+        axes[2, 0].set_title('ILM Concordance Correlation Coefficient')
+        axes[2, 0].set_xlabel('Epoch')
+        axes[2, 0].set_ylabel('CCC')
+        axes[2, 0].legend()
+        axes[2, 0].grid(True, alpha=0.3)
+        
+        # BM CCC plot
+        axes[2, 1].plot(epochs, self.history['train_bm_ccc'], 'b-', label='Train BM CCC', linewidth=2)
+        axes[2, 1].plot(epochs, self.history['val_bm_ccc'], 'r-', label='Val BM CCC', linewidth=2)
+        axes[2, 1].set_title('BM Concordance Correlation Coefficient')
+        axes[2, 1].set_xlabel('Epoch')
+        axes[2, 1].set_ylabel('CCC')
+        axes[2, 1].legend()
+        axes[2, 1].grid(True, alpha=0.3)
+        
+        # Overall CCC plot
+        axes[2, 2].plot(epochs, self.history['train_overall_ccc'], 'b-', label='Train Overall CCC', linewidth=2)
+        axes[2, 2].plot(epochs, self.history['val_overall_ccc'], 'r-', label='Val Overall CCC', linewidth=2)
+        axes[2, 2].set_title('Overall Concordance Correlation Coefficient')
+        axes[2, 2].set_xlabel('Epoch')
+        axes[2, 2].set_ylabel('CCC')
+        axes[2, 2].legend()
+        axes[2, 2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plot_path = os.path.join(self.output_dir, 'training_plots.png')
@@ -450,26 +733,85 @@ class TrainingEngine:
         print(f"Training plots saved to {plot_path}")
     
     def save_training_results(self):
-        """Save training results to JSON."""
+        """Save comprehensive training results to JSON."""
         results = {
             'config': self.config,
             'best_val_dice': self.best_val_dice,
             'best_model_path': self.best_model_path,
             'total_epochs': len(self.history['train_loss']),
             'final_metrics': {
-                'train_dice': self.history['train_dice'][-1] if self.history['train_dice'] else 0,
-                'val_dice': self.history['val_dice'][-1] if self.history['val_dice'] else 0,
-                'train_iou': self.history['train_iou'][-1] if self.history['train_iou'] else 0,
-                'val_iou': self.history['val_iou'][-1] if self.history['val_iou'] else 0,
+                # Segmentation metrics
+                'segmentation': {
+                    'train_dice': self.history['train_dice'][-1] if self.history['train_dice'] else 0,
+                    'val_dice': self.history['val_dice'][-1] if self.history['val_dice'] else 0,
+                    'train_iou': self.history['train_iou'][-1] if self.history['train_iou'] else 0,
+                    'val_iou': self.history['val_iou'][-1] if self.history['val_iou'] else 0,
+                    'train_f1': self.history['train_f1'][-1] if self.history['train_f1'] else 0,
+                    'val_f1': self.history['val_f1'][-1] if self.history['val_f1'] else 0,
+                },
+                # Regression metrics
+                'regression': {
+                    'ilm': {
+                        'train_mae': self.history['train_ilm_mae'][-1] if self.history['train_ilm_mae'] else 0,
+                        'val_mae': self.history['val_ilm_mae'][-1] if self.history['val_ilm_mae'] else 0,
+                        'train_rmse': self.history['train_ilm_rmse'][-1] if self.history['train_ilm_rmse'] else 0,
+                        'val_rmse': self.history['val_ilm_rmse'][-1] if self.history['val_ilm_rmse'] else 0,
+                        'train_ccc': self.history['train_ilm_ccc'][-1] if self.history['train_ilm_ccc'] else 0,
+                        'val_ccc': self.history['val_ilm_ccc'][-1] if self.history['val_ilm_ccc'] else 0,
+                    },
+                    'bm': {
+                        'train_mae': self.history['train_bm_mae'][-1] if self.history['train_bm_mae'] else 0,
+                        'val_mae': self.history['val_bm_mae'][-1] if self.history['val_bm_mae'] else 0,
+                        'train_rmse': self.history['train_bm_rmse'][-1] if self.history['train_bm_rmse'] else 0,
+                        'val_rmse': self.history['val_bm_rmse'][-1] if self.history['val_bm_rmse'] else 0,
+                        'train_ccc': self.history['train_bm_ccc'][-1] if self.history['train_bm_ccc'] else 0,
+                        'val_ccc': self.history['val_bm_ccc'][-1] if self.history['val_bm_ccc'] else 0,
+                    },
+                    'overall': {
+                        'train_mae': self.history['train_overall_mae'][-1] if self.history['train_overall_mae'] else 0,
+                        'val_mae': self.history['val_overall_mae'][-1] if self.history['val_overall_mae'] else 0,
+                        'train_rmse': self.history['train_overall_rmse'][-1] if self.history['train_overall_rmse'] else 0,
+                        'val_rmse': self.history['val_overall_rmse'][-1] if self.history['val_overall_rmse'] else 0,
+                        'train_ccc': self.history['train_overall_ccc'][-1] if self.history['train_overall_ccc'] else 0,
+                        'val_ccc': self.history['val_overall_ccc'][-1] if self.history['val_overall_ccc'] else 0,
+                    }
+                }
             },
-            'history': self.history
+            'complete_history': self.history
         }
         
         results_path = os.path.join(self.output_dir, 'training_results.json')
         with open(results_path, 'w') as f:
             json.dump(results, f, indent=2)
         
-        print(f"Training results saved to {results_path}")
+        print(f"Comprehensive training results saved to {results_path}")
+        
+        # Also save a summary file with key metrics
+        summary = {
+            'model_info': {
+                'architecture': 'Hybrid Attention U-Net',
+                'input_channels': self.config.get('input_channels', 1),
+                'output_channels': self.config.get('output_channels', 3),
+                'total_epochs': len(self.history['train_loss']),
+                'best_epoch': self.history['val_dice'].index(max(self.history['val_dice'])) + 1 if self.history['val_dice'] else 0
+            },
+            'best_performance': {
+                'validation_dice': self.best_val_dice,
+                'best_val_ilm_mae': min(self.history['val_ilm_mae']) if self.history['val_ilm_mae'] else 0,
+                'best_val_bm_mae': min(self.history['val_bm_mae']) if self.history['val_bm_mae'] else 0,
+                'best_val_overall_mae': min(self.history['val_overall_mae']) if self.history['val_overall_mae'] else 0,
+                'best_val_ilm_ccc': max(self.history['val_ilm_ccc']) if self.history['val_ilm_ccc'] else 0,
+                'best_val_bm_ccc': max(self.history['val_bm_ccc']) if self.history['val_bm_ccc'] else 0,
+                'best_val_overall_ccc': max(self.history['val_overall_ccc']) if self.history['val_overall_ccc'] else 0,
+            },
+            'final_performance': results['final_metrics']
+        }
+        
+        summary_path = os.path.join(self.output_dir, 'training_summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print(f"Training summary saved to {summary_path}")
     
     def train(self, num_epochs: int):
         """
@@ -486,44 +828,76 @@ class TrainingEngine:
             print("-" * 50)
             
             # Train
-            train_loss, train_metrics = self.train_epoch()
+            train_loss, train_seg_metrics, train_reg_metrics = self.train_epoch()
             
             # Validate
-            val_loss, val_metrics = self.validate_epoch()
+            val_loss, val_seg_metrics, val_reg_metrics = self.validate_epoch()
             
             # Update learning rate
             self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            # Update history
+            # Update history - segmentation metrics
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
-            self.history['train_dice'].append(train_metrics['dice'])
-            self.history['val_dice'].append(val_metrics['dice'])
-            self.history['train_iou'].append(train_metrics['iou'])
-            self.history['val_iou'].append(val_metrics['iou'])
-            self.history['train_f1'].append(train_metrics['f1'])
-            self.history['val_f1'].append(val_metrics['f1'])
+            self.history['train_dice'].append(train_seg_metrics['dice'])
+            self.history['val_dice'].append(val_seg_metrics['dice'])
+            self.history['train_iou'].append(train_seg_metrics['iou'])
+            self.history['val_iou'].append(val_seg_metrics['iou'])
+            self.history['train_f1'].append(train_seg_metrics['f1'])
+            self.history['val_f1'].append(val_seg_metrics['f1'])
+            
+            # Update history - regression metrics
+            self.history['train_ilm_mae'].append(train_reg_metrics['ilm_mae'])
+            self.history['val_ilm_mae'].append(val_reg_metrics['ilm_mae'])
+            self.history['train_ilm_rmse'].append(train_reg_metrics['ilm_rmse'])
+            self.history['val_ilm_rmse'].append(val_reg_metrics['ilm_rmse'])
+            self.history['train_ilm_ccc'].append(train_reg_metrics['ilm_ccc'])
+            self.history['val_ilm_ccc'].append(val_reg_metrics['ilm_ccc'])
+            self.history['train_bm_mae'].append(train_reg_metrics['bm_mae'])
+            self.history['val_bm_mae'].append(val_reg_metrics['bm_mae'])
+            self.history['train_bm_rmse'].append(train_reg_metrics['bm_rmse'])
+            self.history['val_bm_rmse'].append(val_reg_metrics['bm_rmse'])
+            self.history['train_bm_ccc'].append(train_reg_metrics['bm_ccc'])
+            self.history['val_bm_ccc'].append(val_reg_metrics['bm_ccc'])
+            self.history['train_overall_mae'].append(train_reg_metrics['overall_mae'])
+            self.history['val_overall_mae'].append(val_reg_metrics['overall_mae'])
+            self.history['train_overall_rmse'].append(train_reg_metrics['overall_rmse'])
+            self.history['val_overall_rmse'].append(val_reg_metrics['overall_rmse'])
+            self.history['train_overall_ccc'].append(train_reg_metrics['overall_ccc'])
+            self.history['val_overall_ccc'].append(val_reg_metrics['overall_ccc'])
             self.history['learning_rate'].append(current_lr)
             
             # Print metrics
-            print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-            print(f"Train Dice: {train_metrics['dice']:.4f} | Val Dice: {val_metrics['dice']:.4f}")
-            print(f"Train IoU: {train_metrics['iou']:.4f} | Val IoU: {val_metrics['iou']:.4f}")
-            print(f"Train F1: {train_metrics['f1']:.4f} | Val F1: {val_metrics['f1']:.4f}")
+            print(f"Loss - Train: {train_loss:.4f} | Val: {val_loss:.4f}")
+            print(f"Segmentation Metrics:")
+            print(f"  Dice - Train: {train_seg_metrics['dice']:.4f} | Val: {val_seg_metrics['dice']:.4f}")
+            print(f"  IoU  - Train: {train_seg_metrics['iou']:.4f} | Val: {val_seg_metrics['iou']:.4f}")
+            print(f"  F1   - Train: {train_seg_metrics['f1']:.4f} | Val: {val_seg_metrics['f1']:.4f}")
+            print(f"Regression Metrics:")
+            print(f"  ILM MAE  - Train: {train_reg_metrics['ilm_mae']:.2f} | Val: {val_reg_metrics['ilm_mae']:.2f}")
+            print(f"  ILM RMSE - Train: {train_reg_metrics['ilm_rmse']:.2f} | Val: {val_reg_metrics['ilm_rmse']:.2f}")
+            print(f"  ILM CCC  - Train: {train_reg_metrics['ilm_ccc']:.4f} | Val: {val_reg_metrics['ilm_ccc']:.4f}")
+            print(f"  BM MAE   - Train: {train_reg_metrics['bm_mae']:.2f} | Val: {val_reg_metrics['bm_mae']:.2f}")
+            print(f"  BM RMSE  - Train: {train_reg_metrics['bm_rmse']:.2f} | Val: {val_reg_metrics['bm_rmse']:.2f}")
+            print(f"  BM CCC   - Train: {train_reg_metrics['bm_ccc']:.4f} | Val: {val_reg_metrics['bm_ccc']:.4f}")
+            print(f"  Overall MAE - Train: {train_reg_metrics['overall_mae']:.2f} | Val: {val_reg_metrics['overall_mae']:.2f}")
             print(f"Learning Rate: {current_lr:.2e}")
             
-            # Check for best model
-            is_best = val_metrics['dice'] > self.best_val_dice
+            # Check for best model (using validation dice score)
+            is_best = val_seg_metrics['dice'] > self.best_val_dice
             if is_best:
-                self.best_val_dice = val_metrics['dice']
+                self.best_val_dice = val_seg_metrics['dice']
                 self.early_stop_counter = 0
                 print(f"🎉 New best model! Val Dice: {self.best_val_dice:.4f}")
             else:
                 self.early_stop_counter += 1
             
+            # Combine metrics for saving
+            combined_metrics = {**val_seg_metrics, **val_reg_metrics}
+            
             # Save model
-            self.save_model(epoch, val_metrics, is_best)
+            self.save_model(epoch, combined_metrics, is_best)
             
             # Early stopping
             if self.early_stop_counter >= self.patience:
