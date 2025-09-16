@@ -1,0 +1,106 @@
+# Configuration file for Attention-Based Hybrid U-Net OCT Layer Segmentation
+
+# Dataset configuration
+dataset:
+  hdf5_path: "data/Nemours_Jing_0805.h5"
+  original_size:
+    height: 496
+    width: 768
+  target_size:
+    height: 480
+    width: 768
+  num_classes: 3  # 0: above ILM, 1: ILM to BM, 2: below BM
+
+# Preprocessing configuration
+preprocessing:
+  gaussian_blur:
+    enabled: true
+    kernel_size: 5
+    sigma: 1.0
+  clahe:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+  normalization:
+    mean: 0.0
+    std: 1.0
+    # Image values will be normalized to [0, 1] then standardized
+
+# Data augmentation configuration
+augmentation:
+  # Geometric transformations (applied to both images and masks)
+  geometric:
+    horizontal_flip:
+      enabled: true
+      probability: 0.5
+    vertical_flip:
+      enabled: true
+      probability: 0.3
+    rotation:
+      enabled: true
+      probability: 0.4
+      limit: 15  # degrees
+    
+  # Photometric transformations (applied only to images)
+  photometric:
+    invert_image:
+      enabled: true
+      probability: 0.2
+    random_snow:
+      enabled: true
+      probability: 0.1
+      snow_point_lower: 0.1
+      snow_point_upper: 0.3
+      brightness_coeff: 2.5
+    clahe:
+      enabled: true
+      probability: 0.3
+      clip_limit: 4.0
+      tile_grid_size: [8, 8]
+    blur:
+      enabled: true
+      probability: 0.3
+      blur_limit: 7
+    coarse_dropout:
+      enabled: true
+      probability: 0.2
+      num_holes_range: [1, 8]
+      hole_height_range: [8, 32]
+      hole_width_range: [8, 32]
+      fill: 0
+    downscale:
+      enabled: true
+      probability: 0.2
+      scale_range: [0.5, 0.9]
+      interpolation_upscale: 0  # cv2.INTER_NEAREST
+      interpolation_downscale: 0  # cv2.INTER_NEAREST
+    equalize:
+      enabled: true
+      probability: 0.3
+      mode: "cv"
+      by_channels: false
+
+# Training configuration
+training:
+  batch_size: 8
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  drop_last: false
+  learning_rate: 0.001
+  patience: 10
+  num_epochs: 100
+
+# Model configuration
+model:
+  input_channels: 1
+  output_channels: 3
+  base_channels: 64
+  depth: 5
+
+# Paths
+paths:
+  data_dir: "data"
+  logs_dir: "logs"
+  models_dir: "models"
+  results_dir: "results"
