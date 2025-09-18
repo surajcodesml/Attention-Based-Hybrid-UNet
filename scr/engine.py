@@ -9,6 +9,7 @@ and model saving/loading functionality.
 import os
 import time
 import json
+import matplotlib.pyplot as plt
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -396,20 +397,20 @@ class TrainingEngine:
     """
     Training engine for Hybrid Attention U-Net.
     
-    Handles training loop, validation, metrics tracking, and model saving.
+    Handles training loop, test evaluation, metrics tracking, and model saving.
     """
     
     def __init__(
         self,
         model: nn.Module,
         train_loader: DataLoader,
-        val_loader: DataLoader,
+        test_loader: DataLoader,
         config: Dict,
         device: torch.device
     ):
         self.model = model
         self.train_loader = train_loader
-        self.val_loader = val_loader
+        self.test_loader = test_loader
         self.config = config
         self.device = device
         
@@ -445,47 +446,52 @@ class TrainingEngine:
         # Training history
         self.history = {
             'train_loss': [],
-            'val_loss': [],
+            'test_loss': [],
             'train_dice': [],
-            'val_dice': [],
+            'test_dice': [],
             'train_iou': [],
-            'val_iou': [],
+            'test_iou': [],
             'train_f1': [],
-            'val_f1': [],
+            'test_f1': [],
             'train_ilm_mae': [],
-            'val_ilm_mae': [],
+            'test_ilm_mae': [],
             'train_ilm_rmse': [],
-            'val_ilm_rmse': [],
+            'test_ilm_rmse': [],
             'train_ilm_ccc': [],
-            'val_ilm_ccc': [],
+            'test_ilm_ccc': [],
             'train_bm_mae': [],
-            'val_bm_mae': [],
+            'test_bm_mae': [],
             'train_bm_rmse': [],
-            'val_bm_rmse': [],
+            'test_bm_rmse': [],
             'train_bm_ccc': [],
-            'val_bm_ccc': [],
+            'test_bm_ccc': [],
             'train_overall_mae': [],
-            'val_overall_mae': [],
+            'test_overall_mae': [],
             'train_overall_rmse': [],
-            'val_overall_rmse': [],
+            'test_overall_rmse': [],
             'train_overall_ccc': [],
-            'val_overall_ccc': [],
+            'test_overall_ccc': [],
             'learning_rate': []
         }
         
         # Best model tracking
-        self.best_val_dice = 0.0
+        self.best_test_dice = 0.0
         self.best_model_path = None
 
-        ##################################
         # Training parameters
         training_config = config.get('training', {})
+        optimization_config = config.get('optimization', {})
+        
         self.batch_size = training_config.get('batch_size', 1)
         self.gradient_accumulation_steps = training_config.get('gradient_accumulation_steps', 1)
+        self.gradient_clip_norm = optimization_config.get('gradient_clip_norm', None)
+        self.mixed_precision = optimization_config.get('mixed_precision', False)
         
-        ################
+        # Initialize GradScaler for mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler() if self.mixed_precision else None
+        
         # Early stopping
-        self.patience = config.get('patience', 10)
+        self.patience = training_config.get('patience', 10)
         self.early_stop_counter = 0
         
         # Create output directory
@@ -528,19 +534,39 @@ class TrainingEngine:
             images = images.to(self.device)
             masks = masks.to(self.device)
             
-            # Forward pass
-            outputs = self.model(images)
-            loss = self.criterion(outputs, masks)
+            # Forward pass with optional mixed precision
+            if self.mixed_precision:
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(images)
+                    loss = self.criterion(outputs, masks)
+            else:
+                outputs = self.model(images)
+                loss = self.criterion(outputs, masks)
             
             # Scale loss by accumulation steps
             loss = loss / self.gradient_accumulation_steps
             
             # Backward pass
-            loss.backward()
+            if self.mixed_precision:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
-            # Update weights every gradient_accumulation_steps
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                self.optimizer.step()
+            # Update weights every gradient_accumulation_steps or at the end
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                if self.mixed_precision:
+                    # Gradient clipping for mixed precision
+                    if self.gradient_clip_norm:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Gradient clipping for regular training
+                    if self.gradient_clip_norm:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_norm)
+                    self.optimizer.step()
+                
                 self.optimizer.zero_grad()
             
             # Track metrics (use unscaled loss for reporting)
@@ -561,9 +587,9 @@ class TrainingEngine:
         
         return avg_loss, seg_metrics_dict, reg_metrics_dict
     
-    def validate_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+    def test_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """
-        Validate for one epoch.
+        Test for one epoch.
         
         Returns:
             Tuple of (average_loss, segmentation_metrics_dict, regression_metrics_dict)
@@ -574,7 +600,7 @@ class TrainingEngine:
         reg_metrics = RegressionMetrics()
         
         with torch.no_grad():
-            progress_bar = tqdm(self.val_loader, desc="Validation")
+            progress_bar = tqdm(self.test_loader, desc="Testing")
             
             for batch_idx, (images, masks) in enumerate(progress_bar):
                 images = images.to(self.device)
@@ -595,7 +621,7 @@ class TrainingEngine:
                     'Avg Loss': f'{total_loss/(batch_idx+1):.4f}'
                 })
         
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / len(self.test_loader)
         seg_metrics_dict = seg_metrics.compute()
         reg_metrics_dict = reg_metrics.compute()
         
@@ -646,8 +672,8 @@ class TrainingEngine:
         
         # Loss plot
         axes[0, 0].plot(epochs, self.history['train_loss'], 'b-', label='Train Loss', linewidth=2)
-        axes[0, 0].plot(epochs, self.history['val_loss'], 'r-', label='Val Loss', linewidth=2)
-        axes[0, 0].set_title('Training and Validation Loss')
+        axes[0, 0].plot(epochs, self.history['test_loss'], 'r-', label='Test Loss', linewidth=2)
+        axes[0, 0].set_title('Training and Test Loss')
         axes[0, 0].set_xlabel('Epoch')
         axes[0, 0].set_ylabel('Loss')
         axes[0, 0].legend()
@@ -655,7 +681,7 @@ class TrainingEngine:
         
         # Dice score plot
         axes[0, 1].plot(epochs, self.history['train_dice'], 'b-', label='Train Dice', linewidth=2)
-        axes[0, 1].plot(epochs, self.history['val_dice'], 'r-', label='Val Dice', linewidth=2)
+        axes[0, 1].plot(epochs, self.history['test_dice'], 'r-', label='Test Dice', linewidth=2)
         axes[0, 1].set_title('Dice Score')
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Dice Score')
@@ -664,7 +690,7 @@ class TrainingEngine:
         
         # IoU plot
         axes[0, 2].plot(epochs, self.history['train_iou'], 'b-', label='Train IoU', linewidth=2)
-        axes[0, 2].plot(epochs, self.history['val_iou'], 'r-', label='Val IoU', linewidth=2)
+        axes[0, 2].plot(epochs, self.history['test_iou'], 'r-', label='Test IoU', linewidth=2)
         axes[0, 2].set_title('Intersection over Union (IoU)')
         axes[0, 2].set_xlabel('Epoch')
         axes[0, 2].set_ylabel('IoU')
@@ -673,7 +699,7 @@ class TrainingEngine:
         
         # ILM MAE plot
         axes[1, 0].plot(epochs, self.history['train_ilm_mae'], 'b-', label='Train ILM MAE', linewidth=2)
-        axes[1, 0].plot(epochs, self.history['val_ilm_mae'], 'r-', label='Val ILM MAE', linewidth=2)
+        axes[1, 0].plot(epochs, self.history['test_ilm_mae'], 'r-', label='Test ILM MAE', linewidth=2)
         axes[1, 0].set_title('ILM Mean Absolute Error')
         axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].set_ylabel('MAE (pixels)')
@@ -682,7 +708,7 @@ class TrainingEngine:
         
         # BM MAE plot
         axes[1, 1].plot(epochs, self.history['train_bm_mae'], 'b-', label='Train BM MAE', linewidth=2)
-        axes[1, 1].plot(epochs, self.history['val_bm_mae'], 'r-', label='Val BM MAE', linewidth=2)
+        axes[1, 1].plot(epochs, self.history['test_bm_mae'], 'r-', label='Test BM MAE', linewidth=2)
         axes[1, 1].set_title('BM Mean Absolute Error')
         axes[1, 1].set_xlabel('Epoch')
         axes[1, 1].set_ylabel('MAE (pixels)')
@@ -691,7 +717,7 @@ class TrainingEngine:
         
         # Overall MAE plot
         axes[1, 2].plot(epochs, self.history['train_overall_mae'], 'b-', label='Train Overall MAE', linewidth=2)
-        axes[1, 2].plot(epochs, self.history['val_overall_mae'], 'r-', label='Val Overall MAE', linewidth=2)
+        axes[1, 2].plot(epochs, self.history['test_overall_mae'], 'r-', label='Test Overall MAE', linewidth=2)
         axes[1, 2].set_title('Overall Mean Absolute Error')
         axes[1, 2].set_xlabel('Epoch')
         axes[1, 2].set_ylabel('MAE (pixels)')
@@ -700,7 +726,7 @@ class TrainingEngine:
         
         # ILM CCC plot
         axes[2, 0].plot(epochs, self.history['train_ilm_ccc'], 'b-', label='Train ILM CCC', linewidth=2)
-        axes[2, 0].plot(epochs, self.history['val_ilm_ccc'], 'r-', label='Val ILM CCC', linewidth=2)
+        axes[2, 0].plot(epochs, self.history['test_ilm_ccc'], 'r-', label='Test ILM CCC', linewidth=2)
         axes[2, 0].set_title('ILM Concordance Correlation Coefficient')
         axes[2, 0].set_xlabel('Epoch')
         axes[2, 0].set_ylabel('CCC')
@@ -709,7 +735,7 @@ class TrainingEngine:
         
         # BM CCC plot
         axes[2, 1].plot(epochs, self.history['train_bm_ccc'], 'b-', label='Train BM CCC', linewidth=2)
-        axes[2, 1].plot(epochs, self.history['val_bm_ccc'], 'r-', label='Val BM CCC', linewidth=2)
+        axes[2, 1].plot(epochs, self.history['test_bm_ccc'], 'r-', label='Test BM CCC', linewidth=2)
         axes[2, 1].set_title('BM Concordance Correlation Coefficient')
         axes[2, 1].set_xlabel('Epoch')
         axes[2, 1].set_ylabel('CCC')
@@ -718,7 +744,7 @@ class TrainingEngine:
         
         # Overall CCC plot
         axes[2, 2].plot(epochs, self.history['train_overall_ccc'], 'b-', label='Train Overall CCC', linewidth=2)
-        axes[2, 2].plot(epochs, self.history['val_overall_ccc'], 'r-', label='Val Overall CCC', linewidth=2)
+        axes[2, 2].plot(epochs, self.history['test_overall_ccc'], 'r-', label='Test Overall CCC', linewidth=2)
         axes[2, 2].set_title('Overall Concordance Correlation Coefficient')
         axes[2, 2].set_xlabel('Epoch')
         axes[2, 2].set_ylabel('CCC')
@@ -736,44 +762,44 @@ class TrainingEngine:
         """Save comprehensive training results to JSON."""
         results = {
             'config': self.config,
-            'best_val_dice': self.best_val_dice,
+            'best_test_dice': self.best_test_dice,
             'best_model_path': self.best_model_path,
             'total_epochs': len(self.history['train_loss']),
             'final_metrics': {
                 # Segmentation metrics
                 'segmentation': {
                     'train_dice': self.history['train_dice'][-1] if self.history['train_dice'] else 0,
-                    'val_dice': self.history['val_dice'][-1] if self.history['val_dice'] else 0,
+                    'test_dice': self.history['test_dice'][-1] if self.history['test_dice'] else 0,
                     'train_iou': self.history['train_iou'][-1] if self.history['train_iou'] else 0,
-                    'val_iou': self.history['val_iou'][-1] if self.history['val_iou'] else 0,
+                    'test_iou': self.history['test_iou'][-1] if self.history['test_iou'] else 0,
                     'train_f1': self.history['train_f1'][-1] if self.history['train_f1'] else 0,
-                    'val_f1': self.history['val_f1'][-1] if self.history['val_f1'] else 0,
+                    'test_f1': self.history['test_f1'][-1] if self.history['test_f1'] else 0,
                 },
                 # Regression metrics
                 'regression': {
                     'ilm': {
                         'train_mae': self.history['train_ilm_mae'][-1] if self.history['train_ilm_mae'] else 0,
-                        'val_mae': self.history['val_ilm_mae'][-1] if self.history['val_ilm_mae'] else 0,
+                        'test_mae': self.history['test_ilm_mae'][-1] if self.history['test_ilm_mae'] else 0,
                         'train_rmse': self.history['train_ilm_rmse'][-1] if self.history['train_ilm_rmse'] else 0,
-                        'val_rmse': self.history['val_ilm_rmse'][-1] if self.history['val_ilm_rmse'] else 0,
+                        'test_rmse': self.history['test_ilm_rmse'][-1] if self.history['test_ilm_rmse'] else 0,
                         'train_ccc': self.history['train_ilm_ccc'][-1] if self.history['train_ilm_ccc'] else 0,
-                        'val_ccc': self.history['val_ilm_ccc'][-1] if self.history['val_ilm_ccc'] else 0,
+                        'test_ccc': self.history['test_ilm_ccc'][-1] if self.history['test_ilm_ccc'] else 0,
                     },
                     'bm': {
                         'train_mae': self.history['train_bm_mae'][-1] if self.history['train_bm_mae'] else 0,
-                        'val_mae': self.history['val_bm_mae'][-1] if self.history['val_bm_mae'] else 0,
+                        'test_mae': self.history['test_bm_mae'][-1] if self.history['test_bm_mae'] else 0,
                         'train_rmse': self.history['train_bm_rmse'][-1] if self.history['train_bm_rmse'] else 0,
-                        'val_rmse': self.history['val_bm_rmse'][-1] if self.history['val_bm_rmse'] else 0,
+                        'test_rmse': self.history['test_bm_rmse'][-1] if self.history['test_bm_rmse'] else 0,
                         'train_ccc': self.history['train_bm_ccc'][-1] if self.history['train_bm_ccc'] else 0,
-                        'val_ccc': self.history['val_bm_ccc'][-1] if self.history['val_bm_ccc'] else 0,
+                        'test_ccc': self.history['test_bm_ccc'][-1] if self.history['test_bm_ccc'] else 0,
                     },
                     'overall': {
                         'train_mae': self.history['train_overall_mae'][-1] if self.history['train_overall_mae'] else 0,
-                        'val_mae': self.history['val_overall_mae'][-1] if self.history['val_overall_mae'] else 0,
+                        'test_mae': self.history['test_overall_mae'][-1] if self.history['test_overall_mae'] else 0,
                         'train_rmse': self.history['train_overall_rmse'][-1] if self.history['train_overall_rmse'] else 0,
-                        'val_rmse': self.history['val_overall_rmse'][-1] if self.history['val_overall_rmse'] else 0,
+                        'test_rmse': self.history['test_overall_rmse'][-1] if self.history['test_overall_rmse'] else 0,
                         'train_ccc': self.history['train_overall_ccc'][-1] if self.history['train_overall_ccc'] else 0,
-                        'val_ccc': self.history['val_overall_ccc'][-1] if self.history['val_overall_ccc'] else 0,
+                        'test_ccc': self.history['test_overall_ccc'][-1] if self.history['test_overall_ccc'] else 0,
                     }
                 }
             },
@@ -793,16 +819,16 @@ class TrainingEngine:
                 'input_channels': self.config.get('input_channels', 1),
                 'output_channels': self.config.get('output_channels', 3),
                 'total_epochs': len(self.history['train_loss']),
-                'best_epoch': self.history['val_dice'].index(max(self.history['val_dice'])) + 1 if self.history['val_dice'] else 0
+                'best_epoch': self.history['test_dice'].index(max(self.history['test_dice'])) + 1 if self.history['test_dice'] else 0
             },
             'best_performance': {
-                'validation_dice': self.best_val_dice,
-                'best_val_ilm_mae': min(self.history['val_ilm_mae']) if self.history['val_ilm_mae'] else 0,
-                'best_val_bm_mae': min(self.history['val_bm_mae']) if self.history['val_bm_mae'] else 0,
-                'best_val_overall_mae': min(self.history['val_overall_mae']) if self.history['val_overall_mae'] else 0,
-                'best_val_ilm_ccc': max(self.history['val_ilm_ccc']) if self.history['val_ilm_ccc'] else 0,
-                'best_val_bm_ccc': max(self.history['val_bm_ccc']) if self.history['val_bm_ccc'] else 0,
-                'best_val_overall_ccc': max(self.history['val_overall_ccc']) if self.history['val_overall_ccc'] else 0,
+                'test_dice': self.best_test_dice,
+                'best_test_ilm_mae': min(self.history['test_ilm_mae']) if self.history['test_ilm_mae'] else 0,
+                'best_test_bm_mae': min(self.history['test_bm_mae']) if self.history['test_bm_mae'] else 0,
+                'best_test_overall_mae': min(self.history['test_overall_mae']) if self.history['test_overall_mae'] else 0,
+                'best_test_ilm_ccc': max(self.history['test_ilm_ccc']) if self.history['test_ilm_ccc'] else 0,
+                'best_test_bm_ccc': max(self.history['test_bm_ccc']) if self.history['test_bm_ccc'] else 0,
+                'best_test_overall_ccc': max(self.history['test_overall_ccc']) if self.history['test_overall_ccc'] else 0,
             },
             'final_performance': results['final_metrics']
         }
@@ -830,71 +856,71 @@ class TrainingEngine:
             # Train
             train_loss, train_seg_metrics, train_reg_metrics = self.train_epoch()
             
-            # Validate
-            val_loss, val_seg_metrics, val_reg_metrics = self.validate_epoch()
+            # Test
+            test_loss, test_seg_metrics, test_reg_metrics = self.test_epoch()
             
             # Update learning rate
-            self.scheduler.step(val_loss)
+            self.scheduler.step(test_loss)
             current_lr = self.optimizer.param_groups[0]['lr']
             
             # Update history - segmentation metrics
             self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
+            self.history['test_loss'].append(test_loss)
             self.history['train_dice'].append(train_seg_metrics['dice'])
-            self.history['val_dice'].append(val_seg_metrics['dice'])
+            self.history['test_dice'].append(test_seg_metrics['dice'])
             self.history['train_iou'].append(train_seg_metrics['iou'])
-            self.history['val_iou'].append(val_seg_metrics['iou'])
+            self.history['test_iou'].append(test_seg_metrics['iou'])
             self.history['train_f1'].append(train_seg_metrics['f1'])
-            self.history['val_f1'].append(val_seg_metrics['f1'])
+            self.history['test_f1'].append(test_seg_metrics['f1'])
             
             # Update history - regression metrics
             self.history['train_ilm_mae'].append(train_reg_metrics['ilm_mae'])
-            self.history['val_ilm_mae'].append(val_reg_metrics['ilm_mae'])
+            self.history['test_ilm_mae'].append(test_reg_metrics['ilm_mae'])
             self.history['train_ilm_rmse'].append(train_reg_metrics['ilm_rmse'])
-            self.history['val_ilm_rmse'].append(val_reg_metrics['ilm_rmse'])
+            self.history['test_ilm_rmse'].append(test_reg_metrics['ilm_rmse'])
             self.history['train_ilm_ccc'].append(train_reg_metrics['ilm_ccc'])
-            self.history['val_ilm_ccc'].append(val_reg_metrics['ilm_ccc'])
+            self.history['test_ilm_ccc'].append(test_reg_metrics['ilm_ccc'])
             self.history['train_bm_mae'].append(train_reg_metrics['bm_mae'])
-            self.history['val_bm_mae'].append(val_reg_metrics['bm_mae'])
+            self.history['test_bm_mae'].append(test_reg_metrics['bm_mae'])
             self.history['train_bm_rmse'].append(train_reg_metrics['bm_rmse'])
-            self.history['val_bm_rmse'].append(val_reg_metrics['bm_rmse'])
+            self.history['test_bm_rmse'].append(test_reg_metrics['bm_rmse'])
             self.history['train_bm_ccc'].append(train_reg_metrics['bm_ccc'])
-            self.history['val_bm_ccc'].append(val_reg_metrics['bm_ccc'])
+            self.history['test_bm_ccc'].append(test_reg_metrics['bm_ccc'])
             self.history['train_overall_mae'].append(train_reg_metrics['overall_mae'])
-            self.history['val_overall_mae'].append(val_reg_metrics['overall_mae'])
+            self.history['test_overall_mae'].append(test_reg_metrics['overall_mae'])
             self.history['train_overall_rmse'].append(train_reg_metrics['overall_rmse'])
-            self.history['val_overall_rmse'].append(val_reg_metrics['overall_rmse'])
+            self.history['test_overall_rmse'].append(test_reg_metrics['overall_rmse'])
             self.history['train_overall_ccc'].append(train_reg_metrics['overall_ccc'])
-            self.history['val_overall_ccc'].append(val_reg_metrics['overall_ccc'])
+            self.history['test_overall_ccc'].append(test_reg_metrics['overall_ccc'])
             self.history['learning_rate'].append(current_lr)
             
             # Print metrics
-            print(f"Loss - Train: {train_loss:.4f} | Val: {val_loss:.4f}")
+            print(f"Loss - Train: {train_loss:.4f} | Test: {test_loss:.4f}")
             print(f"Segmentation Metrics:")
-            print(f"  Dice - Train: {train_seg_metrics['dice']:.4f} | Val: {val_seg_metrics['dice']:.4f}")
-            print(f"  IoU  - Train: {train_seg_metrics['iou']:.4f} | Val: {val_seg_metrics['iou']:.4f}")
-            print(f"  F1   - Train: {train_seg_metrics['f1']:.4f} | Val: {val_seg_metrics['f1']:.4f}")
+            print(f"  Dice - Train: {train_seg_metrics['dice']:.4f} | Test: {test_seg_metrics['dice']:.4f}")
+            print(f"  IoU  - Train: {train_seg_metrics['iou']:.4f} | Test: {test_seg_metrics['iou']:.4f}")
+            print(f"  F1   - Train: {train_seg_metrics['f1']:.4f} | Test: {test_seg_metrics['f1']:.4f}")
             print(f"Regression Metrics:")
-            print(f"  ILM MAE  - Train: {train_reg_metrics['ilm_mae']:.2f} | Val: {val_reg_metrics['ilm_mae']:.2f}")
-            print(f"  ILM RMSE - Train: {train_reg_metrics['ilm_rmse']:.2f} | Val: {val_reg_metrics['ilm_rmse']:.2f}")
-            print(f"  ILM CCC  - Train: {train_reg_metrics['ilm_ccc']:.4f} | Val: {val_reg_metrics['ilm_ccc']:.4f}")
-            print(f"  BM MAE   - Train: {train_reg_metrics['bm_mae']:.2f} | Val: {val_reg_metrics['bm_mae']:.2f}")
-            print(f"  BM RMSE  - Train: {train_reg_metrics['bm_rmse']:.2f} | Val: {val_reg_metrics['bm_rmse']:.2f}")
-            print(f"  BM CCC   - Train: {train_reg_metrics['bm_ccc']:.4f} | Val: {val_reg_metrics['bm_ccc']:.4f}")
-            print(f"  Overall MAE - Train: {train_reg_metrics['overall_mae']:.2f} | Val: {val_reg_metrics['overall_mae']:.2f}")
+            print(f"  ILM MAE  - Train: {train_reg_metrics['ilm_mae']:.2f} | Test: {test_reg_metrics['ilm_mae']:.2f}")
+            print(f"  ILM RMSE - Train: {train_reg_metrics['ilm_rmse']:.2f} | Test: {test_reg_metrics['ilm_rmse']:.2f}")
+            print(f"  ILM CCC  - Train: {train_reg_metrics['ilm_ccc']:.4f} | Test: {test_reg_metrics['ilm_ccc']:.4f}")
+            print(f"  BM MAE   - Train: {train_reg_metrics['bm_mae']:.2f} | Test: {test_reg_metrics['bm_mae']:.2f}")
+            print(f"  BM RMSE  - Train: {train_reg_metrics['bm_rmse']:.2f} | Test: {test_reg_metrics['bm_rmse']:.2f}")
+            print(f"  BM CCC   - Train: {train_reg_metrics['bm_ccc']:.4f} | Test: {test_reg_metrics['bm_ccc']:.4f}")
+            print(f"  Overall MAE - Train: {train_reg_metrics['overall_mae']:.2f} | Test: {test_reg_metrics['overall_mae']:.2f}")
             print(f"Learning Rate: {current_lr:.2e}")
             
-            # Check for best model (using validation dice score)
-            is_best = val_seg_metrics['dice'] > self.best_val_dice
+            # Check for best model (using test dice score)
+            is_best = test_seg_metrics['dice'] > self.best_test_dice
             if is_best:
-                self.best_val_dice = val_seg_metrics['dice']
+                self.best_test_dice = test_seg_metrics['dice']
                 self.early_stop_counter = 0
-                print(f"🎉 New best model! Val Dice: {self.best_val_dice:.4f}")
+                print(f"🎉 New best model! Test Dice: {self.best_test_dice:.4f}")
             else:
                 self.early_stop_counter += 1
             
             # Combine metrics for saving
-            combined_metrics = {**val_seg_metrics, **val_reg_metrics}
+            combined_metrics = {**test_seg_metrics, **test_reg_metrics}
             
             # Save model
             self.save_model(epoch, combined_metrics, is_best)
@@ -911,43 +937,100 @@ class TrainingEngine:
         # Training completed
         total_time = time.time() - start_time
         print(f"\nTraining completed in {total_time/3600:.2f} hours")
-        print(f"Best validation Dice score: {self.best_val_dice:.4f}")
+        print(f"Best test Dice score: {self.best_test_dice:.4f}")
         
         # Save final results
         self.save_training_plots()
         self.save_training_results()
 
+    def inference(self, data_loader: DataLoader, save_path: str = None) -> Dict[str, float]:
+        """
+        Generate inference on a dataset and calculate metrics.
+        
+        Args:
+            data_loader: DataLoader for inference
+            save_path: Optional path to save inference results as JSON
+            
+        Returns:
+            Dictionary containing loss and performance metrics
+        """
+        print("Starting inference...")
+        self.model.eval()
+        
+        total_loss = 0.0
+        seg_metrics = SegmentationMetrics(num_classes=3, ignore_background=True)
+        reg_metrics = RegressionMetrics()
+        
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            progress_bar = tqdm(data_loader, desc="Inference")
+            
+            for batch_idx, (images, masks) in enumerate(progress_bar):
+                images = images.to(self.device)
+                masks = masks.to(self.device)
+                
+                # Forward pass
+                outputs = self.model(images)
+                loss = self.criterion(outputs, masks)
+                
+                # Update metrics
+                total_loss += loss.item()
+                seg_metrics.update(outputs, masks)
+                reg_metrics.update(outputs, masks)
+                
+                # Store predictions and targets for detailed analysis
+                pred_classes = torch.argmax(outputs, dim=1)
+                all_predictions.append(pred_classes.cpu().numpy())
+                all_targets.append(masks.cpu().numpy())
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Avg Loss': f'{total_loss/(batch_idx+1):.4f}'
+                })
+        
+        # Calculate final metrics
+        avg_loss = total_loss / len(data_loader)
+        seg_metrics_dict = seg_metrics.compute()
+        reg_metrics_dict = reg_metrics.compute()
+        
+        # Combine all results
+        inference_results = {
+            'loss': avg_loss,
+            'segmentation_metrics': seg_metrics_dict,
+            'regression_metrics': reg_metrics_dict,
+            'model_info': {
+                'architecture': 'Hybrid Attention U-Net',
+                'input_channels': 1,
+                'output_channels': 3,
+                'model_path': self.best_model_path
+            }
+        }
+        
+        # Save results if path provided
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, 'w') as f:
+                json.dump(inference_results, f, indent=2)
+            print(f"Inference results saved to {save_path}")
+        
+        # Print summary
+        print(f"\nInference completed!")
+        print(f"Average Loss: {avg_loss:.4f}")
+        print(f"Segmentation Metrics:")
+        print(f"  Dice: {seg_metrics_dict['dice']:.4f}")
+        print(f"  IoU: {seg_metrics_dict['iou']:.4f}")
+        print(f"  F1: {seg_metrics_dict['f1']:.4f}")
+        print(f"Regression Metrics:")
+        print(f"  ILM MAE: {reg_metrics_dict['ilm_mae']:.2f}")
+        print(f"  BM MAE: {reg_metrics_dict['bm_mae']:.2f}")
+        print(f"  Overall MAE: {reg_metrics_dict['overall_mae']:.2f}")
+        print(f"  ILM CCC: {reg_metrics_dict['ilm_ccc']:.4f}")
+        print(f"  BM CCC: {reg_metrics_dict['bm_ccc']:.4f}")
+        print(f"  Overall CCC: {reg_metrics_dict['overall_ccc']:.4f}")
+        
+        return inference_results
 
-if __name__ == "__main__":
-    """Test the training engine."""
-    print("Testing Training Engine...")
-    
-    # This is just a basic test - real training would use the dataset
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Create dummy model
-    model = HybridAttentionUNet(in_channels=1, out_channels=3)
-    
-    # Test loss functions
-    batch_size, height, width = 2, 480, 768
-    pred = torch.randn(batch_size, 3, height, width)
-    target = torch.randint(0, 3, (batch_size, height, width))
-    
-    # Test Dice loss
-    dice_loss = DiceLoss()
-    dice_value = dice_loss(pred, target)
-    print(f"Dice loss: {dice_value:.4f}")
-    
-    # Test Combined loss
-    combined_loss = CombinedLoss()
-    combined_value = combined_loss(pred, target)
-    print(f"Combined loss: {combined_value:.4f}")
-    
-    # Test metrics
-    metrics = SegmentationMetrics(num_classes=3)
-    metrics.update(pred, target)
-    metrics_dict = metrics.compute()
-    print(f"Metrics: {metrics_dict}")
-    
-    print("✓ Training engine test passed!")
+

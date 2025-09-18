@@ -227,9 +227,14 @@ class OCTDataset(Dataset):
         target_height = self.config['dataset']['target_size']['height']
         target_width = self.config['dataset']['target_size']['width']
         
+        # Get normalization parameters from config
+        norm_config = self.config.get('preprocessing', {}).get('normalization', {})
+        norm_mean = norm_config.get('mean', 0.0)
+        norm_std = norm_config.get('std', 1.0)
+        
         # Base transforms for all modes
         base_transforms = [
-            A.Normalize(mean=0.0, std=1.0, max_pixel_value=255.0),
+            A.Normalize(mean=norm_mean, std=norm_std, max_pixel_value=255.0),
             ToTensorV2()
         ]
         
@@ -504,24 +509,22 @@ class OCTDataset(Dataset):
 def create_data_splits(
     config_path: str, 
     train_ratio: float = 0.8, 
-    val_ratio: float = 0.1, 
-    test_ratio: float = 0.1,
+    test_ratio: float = 0.2,
     random_seed: int = 42
-) -> Tuple[OCTDataset, OCTDataset, OCTDataset]:
+) -> Tuple[OCTDataset, OCTDataset]:
     """
-    Create train, validation, and test datasets with proper splits.
+    Create train and test datasets with proper splits.
     
     Args:
         config_path: Path to the configuration file
         train_ratio: Proportion of data for training
-        val_ratio: Proportion of data for validation
         test_ratio: Proportion of data for testing
         random_seed: Random seed for reproducible splits
         
     Returns:
-        Tuple of (train_dataset, val_dataset, test_dataset)
+        Tuple of (train_dataset, test_dataset)
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
+    assert abs(train_ratio + test_ratio - 1.0) < 1e-6, \
         "Ratios must sum to 1.0"
     
     # Load config to get total number of samples
@@ -536,44 +539,38 @@ def create_data_splits(
     indices = np.random.permutation(total_samples)
     
     train_end = int(train_ratio * total_samples)
-    val_end = train_end + int(val_ratio * total_samples)
     
     train_indices = indices[:train_end]
-    val_indices = indices[train_end:val_end]
-    test_indices = indices[val_end:]
+    test_indices = indices[train_end:]
     
     # Create datasets
     train_dataset = OCTDataset(config_path, mode='train', indices=train_indices)
-    val_dataset = OCTDataset(config_path, mode='val', indices=val_indices)
     test_dataset = OCTDataset(config_path, mode='test', indices=test_indices)
     
     print(f"Data splits created:")
     print(f"  Train: {len(train_dataset)} samples")
-    print(f"  Validation: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, test_dataset
 
 
 def create_data_loaders(
     config_path: str,
     train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
-    test_ratio: float = 0.1,
+    test_ratio: float = 0.2,
     random_seed: int = 42
-) -> Tuple[torch.utils.data.DataLoader, ...]:
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     """
-    Create data loaders for train, validation, and test sets.
+    Create data loaders for train and test sets.
     
     Args:
         config_path: Path to the configuration file
         train_ratio: Proportion of data for training
-        val_ratio: Proportion of data for validation  
         test_ratio: Proportion of data for testing
         random_seed: Random seed for reproducible splits
         
     Returns:
-        Tuple of (train_loader, val_loader, test_loader)
+        Tuple of (train_loader, test_loader)
     """
     # Load config
     with open(config_path, 'r') as f:
@@ -585,8 +582,8 @@ def create_data_loaders(
     pin_memory = config['training']['pin_memory']
     
     # Create datasets
-    train_dataset, val_dataset, test_dataset = create_data_splits(
-        config_path, train_ratio, val_ratio, test_ratio, random_seed
+    train_dataset, test_dataset = create_data_splits(
+        config_path, train_ratio, test_ratio, random_seed
     )
     
     # Create data loaders
@@ -599,15 +596,6 @@ def create_data_loaders(
         drop_last=config['training']['drop_last']
     )
     
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False
-    )
-    
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -617,49 +605,6 @@ def create_data_loaders(
         drop_last=False
     )
     
-    return train_loader, val_loader, test_loader
+    return train_loader, test_loader
 
 
-if __name__ == "__main__":
-    """Test the dataset implementation."""
-    config_path = "config.yaml"
-    
-    print("Testing OCT Dataset with New Augmentation System...")
-    
-    # Test dataset creation
-    try:
-        train_dataset, val_dataset, test_dataset = create_data_splits(config_path)
-        print("✓ Dataset creation successful")
-        
-        # Test augmentation visualization
-        print("Creating augmentation visualization...")
-        train_dataset.visualize_augmentations(sample_idx=0, save_path="augmentation_test.png")
-        
-        # Test data loading
-        sample_image, sample_mask = train_dataset[0]
-        
-        print(f"✓ Sample loading successful")
-        print(f"  Image shape: {sample_image.shape}")
-        print(f"  Image range: [{sample_image.min():.3f}, {sample_image.max():.3f}]")
-        print(f"  Mask shape: {sample_mask.shape}")
-        print(f"  Mask classes: {torch.unique(sample_mask)}")
-        
-        # Test dataset sizes
-        print(f"✓ Dataset sizes:")
-        print(f"  Train: {len(train_dataset)}")
-        print(f"  Val: {len(val_dataset)}")
-        print(f"  Test: {len(test_dataset)}")
-        
-        # Test data loader
-        train_loader, val_loader, test_loader = create_data_loaders(config_path)
-        batch_images, batch_masks = next(iter(train_loader))
-        print(f"✓ Data loader working")
-        print(f"  Batch image shape: {batch_images.shape}")
-        print(f"  Batch mask shape: {batch_masks.shape}")
-        
-        print("\n🎉 All tests passed! New augmentation system is working correctly.")
-        
-    except Exception as e:
-        print(f"❌ Error during testing: {e}")
-        import traceback
-        traceback.print_exc()

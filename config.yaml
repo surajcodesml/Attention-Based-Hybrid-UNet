@@ -1,4 +1,6 @@
 # Configuration file for Attention-Based Hybrid U-Net OCT Layer Segmentation
+# Optimized for NVIDIA A100 80GB GPU
+# For GTX 1650 Ti 4GB: See comments with "GTX 1650 Ti" for recommended values
 
 # Dataset configuration
 dataset:
@@ -80,24 +82,38 @@ augmentation:
       mode: "cv"
       by_channels: false
 
-# Training configuration
+# Training configuration - Optimized for A100 80GB GPU
 training:
-  batch_size: 1  # Reduced for 4GB GPU memory
-  gradient_accumulation_steps: 4  # Simulate batch_size of 4
-  num_workers: 1  # Reduced to save memory
+  batch_size: 32              # A100 80GB: 32, GTX 1650 Ti 4GB: 1
+  gradient_accumulation_steps: 2   # A100 80GB: 2, GTX 1650 Ti 4GB: 32 (to simulate batch_size=32)
+  num_workers: 16             # A100 80GB: 16, GTX 1650 Ti 4GB: 2
   shuffle: true
-  pin_memory: true  # Enable for GPU training
+  pin_memory: true
   drop_last: false
-  learning_rate: 0.001
-  patience: 15  # Increased patience for better convergence
-  num_epochs: 50
+  learning_rate: 0.001        # A100 80GB: 0.001, GTX 1650 Ti 4GB: 0.0005 (lower for stability)
+  patience: 15
+  num_epochs: 100             # A100 80GB: 100, GTX 1650 Ti 4GB: 50
 
-# Model configuration
+# Model configuration - Optimized for A100 80GB GPU
 model:
   input_channels: 1
   output_channels: 3
-  base_channels: 32  # Reduced from 64 to fit 4GB GPU
-  depth: 4           # Reduced from 5 to fit 4GB GPU
+  base_channels: 64           # A100 80GB: 64, GTX 1650 Ti 4GB: 32
+  depth: 5                    # A100 80GB: 5, GTX 1650 Ti 4GB: 4
+
+# Memory and Performance optimization
+optimization:
+  # Mixed precision training (A100 supports it very well)
+  mixed_precision: true       # A100 80GB: true, GTX 1650 Ti 4GB: false (not supported)
+  
+  # Gradient clipping for stability
+  gradient_clip_norm: 1.0
+  
+  # Memory optimization
+  memory_efficient: false     # A100 80GB: false, GTX 1650 Ti 4GB: true
+  
+  # Compilation optimization (PyTorch 2.0+)
+  compile_model: true         # A100 80GB: true, GTX 1650 Ti 4GB: false
 
 # Paths
 paths:
@@ -105,3 +121,21 @@ paths:
   logs_dir: "logs"
   models_dir: "models"
   results_dir: "results"
+
+# GTX 1650 Ti 4GB Recommended Settings:
+# Uncomment and use these settings for GTX 1650 Ti 4GB GPU
+# training:
+#   batch_size: 1
+#   gradient_accumulation_steps: 32
+#   num_workers: 2
+#   learning_rate: 0.0005
+#   num_epochs: 50
+# 
+# model:
+#   base_channels: 32
+#   depth: 4
+# 
+# optimization:
+#   mixed_precision: false
+#   memory_efficient: true
+#   compile_model: false

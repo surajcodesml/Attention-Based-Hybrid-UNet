@@ -1,0 +1,107 @@
+# Configuration file for Attention-Based Hybrid U-Net OCT Layer Segmentation
+# Optimized for GTX 1650 Ti 4GB GPU
+
+# Dataset configuration
+dataset:
+  hdf5_path: "data/Nemours_Jing_0805.h5"
+  original_size:
+    height: 496
+    width: 768
+  target_size:
+    height: 480
+    width: 768
+  num_classes: 3  # 0: above ILM, 1: ILM to BM, 2: below BM
+
+# Preprocessing configuration
+preprocessing:
+  gaussian_blur:
+    enabled: true
+    kernel_size: 5
+    sigma: 1.0
+  clahe:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+  normalization:
+    mean: 0.0
+    std: 1.0
+
+# Data augmentation configuration
+augmentation:
+  # Geometric transformations (applied to both images and masks)
+  geometric:
+    horizontal_flip:
+      enabled: true
+      probability: 0.5
+    vertical_flip:
+      enabled: false  # Disabled to reduce computation
+      probability: 0.0
+    rotation:
+      enabled: true
+      probability: 0.3  # Reduced probability
+      limit: 15  # Reduced degrees
+    
+  # Photometric transformations (applied only to images)
+  photometric:
+    invert_image:
+      enabled: true
+      probability: 0.3
+    random_snow:
+      enabled: false  # Disabled to reduce computation
+      probability: 0.0
+    clahe:
+      enabled: true
+      probability: 0.3
+      clip_limit: 4.0
+      tile_grid_size: [8, 8]
+    blur:
+      enabled: true
+      probability: 0.3
+      blur_limit: 5  # Reduced
+    coarse_dropout:
+      enabled: true
+      probability: 0.3
+      num_holes_range: [1, 4]  # Reduced
+      hole_height_range: [8, 16]  # Reduced
+      hole_width_range: [8, 16]  # Reduced
+      fill: 0
+    downscale:
+      enabled: false  # Disabled to reduce computation
+      probability: 0.0
+    equalize:
+      enabled: true
+      probability: 0.3
+      mode: "cv"
+      by_channels: false
+
+# Training configuration - Optimized for GTX 1650 Ti 4GB
+training:
+  batch_size: 1                    # Small batch size for 4GB GPU
+  gradient_accumulation_steps: 8   # Simulate batch_size of 8
+  num_workers: 2                   # Reduced to save memory
+  shuffle: true
+  pin_memory: false                # Disabled to save memory
+  drop_last: false
+  learning_rate: 0.0005            # Lower learning rate for stability
+  patience: 10
+  num_epochs: 20                   # Reduced for testing
+
+# Model configuration - Optimized for GTX 1650 Ti 4GB
+model:
+  input_channels: 1
+  output_channels: 3
+  base_channels: 32               # Reduced from 64 to fit in 4GB
+
+# Memory and Performance optimization for GTX 1650 Ti 4GB
+optimization:
+  mixed_precision: false          # GTX 1650 Ti doesn't support it well
+  gradient_clip_norm: 1.0
+  memory_efficient: true
+  compile_model: false
+
+# Paths
+paths:
+  data_dir: "data"
+  logs_dir: "logs"
+  models_dir: "models"
+  results_dir: "results"
