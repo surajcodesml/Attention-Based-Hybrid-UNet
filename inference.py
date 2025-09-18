@@ -59,16 +59,24 @@ class InferenceEngine:
     
     def _load_model(self) -> torch.nn.Module:
         """Load the trained model from checkpoint."""
-        print(f"Loading model from {self.model_path}")
-        
-        # Load checkpoint
         checkpoint = torch.load(self.model_path, map_location=self.device)
         
-        # Get model config from checkpoint or use defaults
-        model_config = checkpoint.get('config', {}).get('model', {})
-        in_channels = model_config.get('input_channels', 1)
-        out_channels = model_config.get('output_channels', 3)
-        base_channels = model_config.get('base_channels', 64)
+        # Infer model architecture from saved weights
+        state_dict = checkpoint['model_state_dict']
+        
+        # Infer input channels from first conv layer
+        in_channels = state_dict['encoder1.conv_block.0.weight'].shape[1]
+        
+        # Infer base channels from first conv layer output
+        base_channels = state_dict['encoder1.conv_block.0.weight'].shape[0]
+        
+        # Infer output channels from final conv layer
+        out_channels = state_dict['final_conv.weight'].shape[0]
+        
+        print(f"Inferred model architecture from weights:")
+        print(f"  Input channels: {in_channels}")
+        print(f"  Base channels: {base_channels}")
+        print(f"  Output channels: {out_channels}")
         
         # Create model with correct parameters
         model = HybridAttentionUNet(
@@ -78,13 +86,12 @@ class InferenceEngine:
         )
         
         # Load state dict
-        model.load_state_dict(checkpoint['model_state_dict'])
+        model.load_state_dict(state_dict)
         model.to(self.device)
         model.eval()
         
         print(f"Model loaded successfully")
         print(f"Model trained for {checkpoint.get('epoch', 'unknown')} epochs")
-        print(f"Model parameters: in_channels={in_channels}, out_channels={out_channels}, base_channels={base_channels}")
         
         return model
     

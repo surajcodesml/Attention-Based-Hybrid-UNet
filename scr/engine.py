@@ -23,7 +23,7 @@ from tqdm import tqdm
 import cv2
 from scipy.stats import pearsonr
 
-from .model import HybridAttentionUNet
+from model import HybridAttentionUNet
 
 
 class DiceLoss(nn.Module):

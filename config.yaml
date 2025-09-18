@@ -98,7 +98,7 @@ training:
 model:
   input_channels: 1
   output_channels: 3
-  base_channels: 64           # A100 80GB: 64, GTX 1650 Ti 4GB: 32
+  base_channels: 32           # A100 80GB: 64, GTX 1650 Ti 4GB: 32 (CURRENTLY TRAINED WITH 32)
   depth: 5                    # A100 80GB: 5, GTX 1650 Ti 4GB: 4
 
 # Memory and Performance optimization
